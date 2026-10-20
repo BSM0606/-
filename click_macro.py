@@ -1,6 +1,6 @@
-"""예약 마우스 클릭 매크로 (밀리초 단위, 서버 시간 기준)
+"""예약 마우스 클릭 매크로 (밀리초 단위, 서버 시간 + 네트워크 지연 보정)
 
-지정한 서버 시각(HH:MM:SS.mmm)에 지정한 좌표를 클릭합니다.
+지정한 서버 시각(HH:MM:SS.mmm)에 요청이 서버에 도착하도록 지정한 좌표를 클릭합니다.
 - F8 : 현재 마우스 위치를 클릭 좌표로 저장
 - ESC: 예약 취소
 """
@@ -9,6 +9,7 @@ import datetime as dt
 import email.utils
 import http.client
 import math
+import statistics
 import sys
 import threading
 import time
@@ -29,6 +30,7 @@ if sys.platform == "win32":
     ctypes.windll.winmm.timeBeginPeriod(1)
 
 BUSY_WAIT_SEC = 0.02  # 목표 시각 20ms 전부터는 sleep 대신 busy-wait
+REMEASURE_BEFORE_SEC = 10  # 클릭 몇 초 전에 지연을 다시 측정할지
 
 BUTTONS = {"왼쪽": mouse.Button.left, "오른쪽": mouse.Button.right, "가운데": mouse.Button.middle}
 
@@ -45,29 +47,49 @@ def parse_target(text: str) -> dt.datetime:
     raise ValueError("시각 형식은 HH:MM:SS.mmm 이어야 합니다. 예) 16:30:00.000")
 
 
-def measure_server_offset(url: str, samples: int = 20, progress=None):
-    """서버 응답의 Date 헤더로 서버 시계와 PC 시계의 차이를 측정.
+class Probe:
+    """한 서버에 연결을 유지한 채 HEAD 요청을 반복 보내는 도우미."""
+
+    HEADERS = {"User-Agent": "Mozilla/5.0", "Cache-Control": "no-cache"}
+
+    def __init__(self, url: str):
+        if "://" not in url:
+            url = "https://" + url
+        parts = urllib.parse.urlsplit(url)
+        conn_cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+        self.conn = conn_cls(parts.netloc, timeout=5)
+        self.path = (parts.path or "/") + ("?" + parts.query if parts.query else "")
+        self.ping()  # 연결(TLS 핸드셰이크)을 미리 맺어 두어 이후 측정에서 제외
+
+    def ping(self):
+        """요청 1회. 반환: (보낸 PC 시각, 받은 PC 시각, 서버 Date 헤더 epoch 초)."""
+        t0 = time.time()
+        self.conn.request("HEAD", self.path, headers=self.HEADERS)
+        resp = self.conn.getresponse()
+        resp.read()
+        t1 = time.time()
+        date = resp.getheader("Date")
+        if not date:
+            raise RuntimeError("서버 응답에 Date 헤더가 없습니다.")
+        return t0, t1, email.utils.parsedate_to_datetime(date).timestamp()
+
+    def close(self):
+        self.conn.close()
+
+
+def measure_server(url: str, samples: int = 20, progress=None):
+    """서버 시계와 PC 시계의 차이, 왕복 지연(RTT)을 측정.
 
     Date 헤더는 초 단위라서, 요청을 여러 번 보내 초가 바뀌는 순간을 좁혀 들어가는 방식으로
-    밀리초 단위 차이를 추정한다. 반환: (offset 초, 오차 범위 ±초). 서버시각 = PC시각 + offset.
+    밀리초 단위 차이를 추정한다. 서버시각 = PC시각 + offset.
+    반환: (offset 초, offset 오차 ±초, RTT 목록 초)
     """
-    if "://" not in url:
-        url = "https://" + url
-    parts = urllib.parse.urlsplit(url)
-    conn_cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
-    conn = conn_cls(parts.netloc, timeout=5)
-    path = parts.path or "/"
-    if parts.query:
-        path += "?" + parts.query
-    headers = {"User-Agent": "Mozilla/5.0", "Cache-Control": "no-cache"}
-
     # 서버 시각이 [S, S+1) 이고 응답이 PC 시각 [t0, t1] 사이에 만들어졌다면
     # offset 은 [S - t1, S + 1 - t0) 범위. 여러 번 측정해 범위의 교집합을 구한다.
     lo, hi = -float("inf"), float("inf")
-    rtt = 0.0
+    rtts = []
+    probe = Probe(url)
     try:
-        conn.request("HEAD", path, headers=headers)  # 연결(TLS 핸드셰이크) 미리 맺기
-        conn.getresponse().read()
         for i in range(samples):
             now = time.time()
             if i < 5 or hi - lo > 0.9:
@@ -77,28 +99,41 @@ def measure_server_offset(url: str, samples: int = 20, progress=None):
                 # 범위가 좁아지면 예상되는 서버 초 경계 근처를 겨냥해 범위를 더 좁힌다
                 mid = (lo + hi) / 2
                 edge = math.floor(now + mid) + 1 - mid  # 다음 서버 초 경계의 PC 시각
-                aim = edge + (hi - lo) * (0.25 if i % 2 else -0.25) - rtt / 2
+                aim = edge + (hi - lo) * (0.25 if i % 2 else -0.25) - rtts[-1] / 2
                 while aim < now + 0.01:
                     aim += 1
                 time.sleep(aim - now)
-            t0 = time.time()
-            conn.request("HEAD", path, headers=headers)
-            resp = conn.getresponse()
-            resp.read()
-            t1 = time.time()
-            rtt = t1 - t0
-            date = resp.getheader("Date")
-            if not date:
-                raise RuntimeError("서버 응답에 Date 헤더가 없습니다.")
-            server_sec = email.utils.parsedate_to_datetime(date).timestamp()
+            t0, t1, server_sec = probe.ping()
+            rtts.append(t1 - t0)
             new_lo, new_hi = max(lo, server_sec - t1), min(hi, server_sec + 1 - t0)
             if new_lo < new_hi:  # 튀는 측정값(지연 등)은 무시
                 lo, hi = new_lo, new_hi
             if progress:
                 progress(i + 1, samples, (lo + hi) / 2, (hi - lo) / 2)
     finally:
-        conn.close()
-    return (lo + hi) / 2, (hi - lo) / 2
+        probe.close()
+    return (lo + hi) / 2, (hi - lo) / 2, rtts
+
+
+def measure_rtt(url: str, samples: int = 8):
+    """왕복 지연(RTT)만 빠르게 측정. 반환: RTT 목록(초)."""
+    probe = Probe(url)
+    try:
+        rtts = []
+        for _ in range(samples):
+            t0, t1, _ = probe.ping()
+            rtts.append(t1 - t0)
+            time.sleep(0.05)
+        return rtts
+    finally:
+        probe.close()
+
+
+def one_way_delay(rtts):
+    """RTT 목록 → (편도 지연 추정, 흔들림) 초. 편도 지연은 RTT 중앙값의 절반으로 본다."""
+    med = statistics.median(rtts)
+    p90 = sorted(rtts)[int(len(rtts) * 0.9) - 1] if len(rtts) >= 2 else med
+    return med / 2, max(0.0, p90 - med) / 2
 
 
 def wait_until(target_epoch: float, cancel: threading.Event) -> bool:
@@ -122,6 +157,7 @@ class App:
         self.cancel = threading.Event()
         self.worker = None
         self.server_offset = 0.0  # 서버시각 = PC시각 + server_offset (초)
+        self.net_delay = 0.0  # 클릭 → 서버 도착까지 네트워크 편도 지연 추정 (초)
 
         root.title("예약 클릭 매크로")
         root.attributes("-topmost", True)
@@ -133,13 +169,18 @@ class App:
         tk.Label(root, text="서버 주소").grid(row=row, column=0, sticky="w", **pad)
         self.url_var = tk.StringVar(value="https://berriz.in")
         tk.Entry(root, textvariable=self.url_var, width=24).grid(row=row, column=1, sticky="w", **pad)
-        self.measure_btn = tk.Button(root, text="서버 시간 측정", command=self.measure)
+        self.measure_btn = tk.Button(root, text="서버 측정", command=self.measure)
         self.measure_btn.grid(row=row, column=2, sticky="w", **pad)
         row += 1
 
         tk.Label(root, text="서버 시차").grid(row=row, column=0, sticky="w", **pad)
         self.offset_info_var = tk.StringVar(value="측정 안 함 (PC 시각 사용)")
         tk.Label(root, textvariable=self.offset_info_var).grid(row=row, column=1, columnspan=2, sticky="w", **pad)
+        row += 1
+
+        tk.Label(root, text="네트워크 지연").grid(row=row, column=0, sticky="w", **pad)
+        self.delay_info_var = tk.StringVar(value="측정 안 함")
+        tk.Label(root, textvariable=self.delay_info_var).grid(row=row, column=1, columnspan=2, sticky="w", **pad)
         row += 1
 
         tk.Label(root, text="서버 시각").grid(row=row, column=0, sticky="w", **pad)
@@ -149,7 +190,7 @@ class App:
         )
         row += 1
 
-        tk.Label(root, text="예약 시각").grid(row=row, column=0, sticky="w", **pad)
+        tk.Label(root, text="도착 목표 시각").grid(row=row, column=0, sticky="w", **pad)
         self.time_var = tk.StringVar(value=(dt.datetime.now() + dt.timedelta(minutes=1)).strftime("%H:%M:00.000"))
         tk.Entry(root, textvariable=self.time_var, width=16, font=("Consolas", 12)).grid(
             row=row, column=1, sticky="w", **pad
@@ -157,10 +198,22 @@ class App:
         tk.Label(root, text="서버 기준 HH:MM:SS.mmm").grid(row=row, column=2, sticky="w", **pad)
         row += 1
 
-        tk.Label(root, text="추가 보정(ms)").grid(row=row, column=0, sticky="w", **pad)
+        self.auto_delay_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            root, text="네트워크 지연만큼 일찍 클릭 (클릭 10초 전 재측정)", variable=self.auto_delay_var
+        ).grid(row=row, column=0, columnspan=3, sticky="w", **pad)
+        row += 1
+
+        tk.Label(root, text="브라우저 지연(ms)").grid(row=row, column=0, sticky="w", **pad)
+        self.browser_var = tk.StringVar(value="0")
+        tk.Entry(root, textvariable=self.browser_var, width=8).grid(row=row, column=1, sticky="w", **pad)
+        tk.Label(root, text="클릭→요청 전송, 이만큼 일찍").grid(row=row, column=2, sticky="w", **pad)
+        row += 1
+
+        tk.Label(root, text="안전 여유(ms)").grid(row=row, column=0, sticky="w", **pad)
         self.extra_var = tk.StringVar(value="0")
         tk.Entry(root, textvariable=self.extra_var, width=8).grid(row=row, column=1, sticky="w", **pad)
-        tk.Label(root, text="음수=일찍, 양수=늦게").grid(row=row, column=2, sticky="w", **pad)
+        tk.Label(root, text="양수=늦게 (측정 후 자동 입력)").grid(row=row, column=2, sticky="w", **pad)
         row += 1
 
         tk.Label(root, text="좌표 X, Y").grid(row=row, column=0, sticky="w", **pad)
@@ -196,7 +249,9 @@ class App:
         row += 1
 
         self.status_var = tk.StringVar(value="대기 중")
-        tk.Label(root, textvariable=self.status_var, fg="blue").grid(row=row, column=0, columnspan=3, **pad)
+        tk.Label(root, textvariable=self.status_var, fg="blue", justify="left").grid(
+            row=row, column=0, columnspan=3, **pad
+        )
 
         self.hotkeys = keyboard.Listener(on_press=self.on_key)
         self.hotkeys.daemon = True
@@ -222,25 +277,37 @@ class App:
         elif key == keyboard.Key.esc:
             self.stop()
 
-    # ---------- 서버 시간 ----------
+    def show_delay(self, rtts, jitter):
+        self.root.after(
+            0,
+            self.delay_info_var.set,
+            f"왕복 {statistics.median(rtts) * 1000:.0f}ms (최소 {min(rtts) * 1000:.0f} / 최대 {max(rtts) * 1000:.0f})"
+            f" → 편도 {self.net_delay * 1000:.0f}ms, 흔들림 ±{jitter * 1000:.0f}ms",
+        )
+
+    # ---------- 서버 측정 ----------
     def measure(self):
         url = self.url_var.get().strip()
         if not url:
             messagebox.showerror("입력 오류", "서버 주소를 입력하세요.")
             return
         self.measure_btn.config(state="disabled")
-        self.set_status("서버 시간 측정 중... (약 20초)")
+        self.set_status("서버 측정 중... (약 20초)")
 
         def progress(i, n, off, err):
             self.set_status(f"측정 중 {i}/{n}  시차 {off * 1000:+.0f}ms (±{err * 1000:.0f}ms)")
 
         def work():
             try:
-                off, err = measure_server_offset(url, progress=progress)
+                off, err, rtts = measure_server(url, progress=progress)
                 self.server_offset = off
+                self.net_delay, jitter = one_way_delay(rtts)
                 info = f"PC보다 {abs(off) * 1000:.0f}ms {'빠름' if off >= 0 else '느림'} (오차 ±{err * 1000:.0f}ms)"
                 self.root.after(0, self.offset_info_var.set, info)
-                self.set_status("서버 시간 측정 완료")
+                self.show_delay(rtts, jitter)
+                # 시차 오차 + 지연 흔들림만큼 늦게 눌러야 목표 시각보다 일찍 도착하지 않음
+                self.root.after(0, self.extra_var.set, str(math.ceil((err + jitter) * 1000)))
+                self.set_status("측정 완료. 안전 여유가 자동 입력되었습니다.")
             except Exception as e:
                 self.set_status(f"측정 실패: {e}")
             finally:
@@ -249,60 +316,91 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     # ---------- 예약 ----------
+    def click_epoch(self, target: dt.datetime, browser_ms: float, extra_ms: float, auto: bool) -> float:
+        """서버 도착 목표 시각 → 실제로 클릭할 PC 시각."""
+        lead = (self.net_delay if auto else 0.0) + browser_ms / 1000
+        return target.timestamp() - self.server_offset - lead + extra_ms / 1000
+
     def start(self):
         if self.worker and self.worker.is_alive():
             messagebox.showinfo("알림", "이미 예약되어 있습니다.")
             return
         try:
             target = parse_target(self.time_var.get())
+            browser_ms = float(self.browser_var.get() or 0)
             extra_ms = float(self.extra_var.get() or 0)
             x, y = int(self.x_var.get()), int(self.y_var.get())
             count = max(1, int(self.count_var.get()))
             interval = max(0.0, float(self.interval_var.get())) / 1000
             button = BUTTONS[self.button_var.get()]
+            auto = self.auto_delay_var.get()
+            url = self.url_var.get().strip()
         except ValueError as e:
             messagebox.showerror("입력 오류", str(e))
             return
 
-        # 서버 시각 → PC 시각으로 변환
-        target_epoch = target.timestamp() - self.server_offset + extra_ms / 1000
-        if target_epoch <= time.time():
+        if self.click_epoch(target, browser_ms, extra_ms, auto) <= time.time():
             messagebox.showerror("입력 오류", "예약 시각이 이미 지났습니다.")
             return
 
         self.cancel.clear()
         self.start_btn.config(state="disabled")
-        self.set_status(f"예약됨: 서버 {target.strftime('%H:%M:%S.%f')[:-3]} → ({x}, {y})")
         self.worker = threading.Thread(
-            target=self.run, args=(target_epoch, x, y, count, interval, button), daemon=True
+            target=self.run, args=(target, browser_ms, extra_ms, auto, url, x, y, count, interval, button), daemon=True
         )
         self.worker.start()
 
-    def run(self, target_epoch, x, y, count, interval, button):
+    def announce(self, target, click_epoch):
+        click_server = dt.datetime.fromtimestamp(click_epoch + self.server_offset)
+        lead_ms = (target.timestamp() - click_server.timestamp()) * 1000
+        self.set_status(
+            f"예약됨: 서버 {click_server.strftime('%H:%M:%S.%f')[:-3]}에 클릭"
+            f" ({lead_ms:+.0f}ms 일찍) → 도착 목표 {target.strftime('%H:%M:%S.%f')[:-3]}"
+        )
+
+    def run(self, target, browser_ms, extra_ms, auto, url, x, y, count, interval, button):
         try:
+            click_at = self.click_epoch(target, browser_ms, extra_ms, auto)
+            self.announce(target, click_at)
+
+            # 클릭 직전에 네트워크 지연을 다시 측정 (회선 상태는 계속 변하므로)
+            if auto and url:
+                if not wait_until(click_at - REMEASURE_BEFORE_SEC, self.cancel):
+                    self.set_status("취소됨")
+                    return
+                if click_at - time.time() > 3:
+                    try:
+                        rtts = measure_rtt(url)
+                        self.net_delay, jitter = one_way_delay(rtts)
+                        self.show_delay(rtts, jitter)
+                        click_at = self.click_epoch(target, browser_ms, extra_ms, auto)
+                        self.announce(target, click_at)
+                    except Exception as e:
+                        self.set_status(f"재측정 실패({e}), 기존 값으로 진행")
+
             # 미리 커서를 옮겨 두면 클릭 순간의 지연이 줄어듦 (1초 전)
-            if not wait_until(target_epoch - 1.0, self.cancel):
+            if not wait_until(click_at - 1.0, self.cancel):
                 self.set_status("취소됨")
                 return
             self.mouse.position = (x, y)
 
-            if not wait_until(target_epoch, self.cancel):
+            if not wait_until(click_at, self.cancel):
                 self.set_status("취소됨")
                 return
 
             fired = []
             for i in range(count):
                 if i:
-                    if not wait_until(target_epoch + interval * i, self.cancel):
+                    if not wait_until(click_at + interval * i, self.cancel):
                         break
                 self.mouse.position = (x, y)
                 self.mouse.click(button)
                 fired.append(time.time())
 
             if fired:
-                err_ms = (fired[0] - target_epoch) * 1000
+                err_ms = (fired[0] - click_at) * 1000
                 first = dt.datetime.fromtimestamp(fired[0] + self.server_offset).strftime("%H:%M:%S.%f")[:-3]
-                self.set_status(f"완료: {len(fired)}회 클릭, 첫 클릭 서버 {first} (오차 {err_ms:+.2f}ms)")
+                self.set_status(f"완료: {len(fired)}회 클릭, 첫 클릭 서버 {first} (타이머 오차 {err_ms:+.2f}ms)")
             else:
                 self.set_status("취소됨")
         finally:
