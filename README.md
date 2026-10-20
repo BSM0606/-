@@ -2,19 +2,20 @@
 
 지정한 시각(밀리초 단위)에 지정한 화면 좌표를 마우스로 클릭하는 프로그램입니다.
 
-## 설치
+## 설치와 실행 (Windows)
 
-Python 3.9 이상이 필요합니다.
+1. https://www.python.org/downloads/ 에서 파이썬을 설치합니다. 설치 첫 화면의 **"Add python.exe to PATH"를 체크**하세요.
+2. 이 저장소를 ZIP으로 받아 압축을 풉니다.
+3. **`run.bat`을 더블클릭**합니다. 처음 실행할 때는 필요한 패키지를 자동으로 설치합니다.
+
+명령어로 실행하려면:
 
 ```bash
 pip install -r requirements.txt
-```
-
-## 실행
-
-```bash
 python click_macro.py
 ```
+
+입력한 값(주소, 좌표, 기준 시각 등)은 `settings.json`에 저장되어 다음 실행 때 그대로 불러옵니다.
 
 ## 사용법
 

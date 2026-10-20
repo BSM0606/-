@@ -11,6 +11,7 @@ import csv
 import datetime as dt
 import email.utils
 import http.client
+import json
 import math
 import os
 import statistics
@@ -36,7 +37,12 @@ if sys.platform == "win32":
 BUSY_WAIT_SEC = 0.02  # 목표 시각 20ms 전부터는 sleep 대신 busy-wait
 LIVE_START_SEC = 6.0  # 클릭 몇 초 전부터 실시간 지연을 잴지
 LIVE_WINDOW = 5  # 최근 몇 번의 측정값(중앙값)으로 판단할지
-LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "click_log.csv")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_PATH = os.path.join(BASE_DIR, "click_log.csv")
+SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
+# 다음 실행 때 그대로 불러올 입력값
+SAVED_FIELDS = ("url_var", "time_var", "live_var", "max_adj_var", "x_var", "y_var",
+                "button_var", "count_var", "interval_var")
 
 BUTTONS = {"왼쪽": mouse.Button.left, "오른쪽": mouse.Button.right, "가운데": mouse.Button.middle}
 
@@ -69,12 +75,19 @@ class Probe:
         conn_cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
         self.conn = conn_cls(parts.netloc, timeout=5)
         self.path = (parts.path or "/") + ("?" + parts.query if parts.query else "")
-        self.ping()  # 연결(TLS 핸드셰이크)을 미리 맺어 두어 이후 측정에서 제외
+        self.method = "HEAD"
+        try:
+            self.ping()  # 연결(TLS 핸드셰이크)을 미리 맺어 두어 이후 측정에서 제외
+        except (OSError, http.client.HTTPException, RuntimeError):
+            # HEAD 요청을 거부하는 서버도 있어서 GET으로 다시 시도
+            self.conn.close()
+            self.method = "GET"
+            self.ping()
 
     def ping(self):
         """요청 1회. 반환: (보낸 PC 시각, 받은 PC 시각, 서버 Date 헤더 epoch 초)."""
         t0 = time.time()
-        self.conn.request("HEAD", self.path, headers=self.HEADERS)
+        self.conn.request(self.method, self.path, headers=self.HEADERS)
         resp = self.conn.getresponse()
         resp.read()
         t1 = time.time()
@@ -273,7 +286,32 @@ class App:
         self.hotkeys.daemon = True
         self.hotkeys.start()
 
+        self.load_settings()
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.tick()
+
+    # ---------- 설정 저장 ----------
+    def load_settings(self):
+        try:
+            with open(SETTINGS_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+            for name in SAVED_FIELDS:
+                if name in data:
+                    getattr(self, name).set(data[name])
+        except (OSError, ValueError, tk.TclError):
+            pass
+
+    def save_settings(self):
+        try:
+            data = {name: getattr(self, name).get() for name in SAVED_FIELDS}
+            with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except (OSError, tk.TclError):
+            pass
+
+    def on_close(self):
+        self.save_settings()
+        self.root.destroy()
 
     # ---------- UI ----------
     def tick(self):
@@ -352,6 +390,7 @@ class App:
             messagebox.showerror("입력 오류", "예약 시각이 이미 지났습니다.")
             return
 
+        self.save_settings()
         self.cancel.clear()
         self.start_btn.config(state="disabled")
         self.live_info_var.set("-")
