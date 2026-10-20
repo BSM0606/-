@@ -1,0 +1,42 @@
+name: Build Windows exe
+
+on:
+  push:
+    branches: [ccr-f516562e-y7dfb7, main]
+    paths: [click_macro.py, requirements.txt, .github/workflows/build-exe.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Build exe
+        run: pyinstaller --onefile --windowed --name ClickMacro click_macro.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ClickMacro
+          path: dist/ClickMacro.exe
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete exe-latest --yes --cleanup-tag || true
+          gh release create exe-latest dist/ClickMacro.exe \
+            --target "$GITHUB_SHA" --prerelease \
+            --title "ClickMacro.exe (latest build)" \
+            --notes "Built from $GITHUB_SHA on branch $GITHUB_REF_NAME."

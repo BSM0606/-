@@ -37,7 +37,8 @@ if sys.platform == "win32":
 BUSY_WAIT_SEC = 0.02  # 목표 시각 20ms 전부터는 sleep 대신 busy-wait
 LIVE_START_SEC = 6.0  # 클릭 몇 초 전부터 실시간 지연을 잴지
 LIVE_WINDOW = 5  # 최근 몇 번의 측정값(중앙값)으로 판단할지
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# 실행 파일(.exe)로 묶였을 때는 임시 폴더가 아닌 exe가 있는 폴더에 설정/기록을 저장
+BASE_DIR = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
 LOG_PATH = os.path.join(BASE_DIR, "click_log.csv")
 SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
 # 다음 실행 때 그대로 불러올 입력값
