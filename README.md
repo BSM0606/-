@@ -2,7 +2,16 @@
 
 지정한 시각(밀리초 단위)에 지정한 화면 좌표를 마우스로 클릭하는 프로그램입니다.
 
-## 설치와 실행 (Windows)
+## 실행 파일로 쓰기 (가장 간단)
+
+1. https://github.com/BSM0606/-/releases/tag/exe-latest 에서 `ClickMacro.exe`를 받습니다.
+2. 원하는 폴더에 두고 더블클릭합니다. 파이썬 설치가 필요 없습니다.
+3. "Windows의 PC 보호" 창이 뜨면 **추가 정보 → 실행**을 누릅니다(서명되지 않은 프로그램이라 뜨는 경고입니다).
+
+설정(`settings.json`)과 기록(`click_log.csv`)은 exe와 같은 폴더에 저장됩니다.
+코드가 바뀌면 GitHub Actions가 exe를 자동으로 다시 만듭니다.
+
+## 파이썬으로 실행 (Windows)
 
 1. https://www.python.org/downloads/ 에서 파이썬을 설치합니다. 설치 첫 화면의 **"Add python.exe to PATH"를 체크**하세요.
 2. 이 저장소를 ZIP으로 받아 압축을 풉니다.
